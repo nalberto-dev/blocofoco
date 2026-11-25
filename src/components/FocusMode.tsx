@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Check, Minus, Pause, Play, Plus, X } from 'lucide-react'
 import Checklist from './Checklist'
 import ProgressBar from './ProgressBar'
+import { notify } from '../lib/notify'
 import type { BlocksApi } from '../hooks/useBlocks'
 import { CATEGORY_STYLE, type Block } from '../types'
 
@@ -18,9 +19,9 @@ interface Props {
 
 export default function FocusMode({ block, api, onClose }: Props) {
   const initial = block.estimated_minutes * 60_000
-  const [totalMs, setTotalMs] = useState(initial) // duração total (muda com os ajustes)
-  const [endAt, setEndAt] = useState<number | null>(() => Date.now() + initial) // timestamp do fim; null = pausado/finalizado
-  const [pausedMs, setPausedMs] = useState(initial) // tempo restante enquanto pausado
+  const [totalMs, setTotalMs] = useState(initial)
+  const [endAt, setEndAt] = useState<number | null>(() => Date.now() + initial)
+  const [pausedMs, setPausedMs] = useState(initial)
   const [now, setNow] = useState(() => Date.now())
   const [done, setDone] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -36,27 +37,31 @@ export default function FocusMode({ block, api, onClose }: Props) {
       /* sem áudio: segue só com vibração */
     }
     return () => {
-      void audioRef.current?.close()
+      void audioRef.current?.close().catch(() => {})
     }
   }, [])
 
   function beep() {
-    const ctx = audioRef.current
-    if (!ctx) return
-    void ctx.resume()
-    ;[0, 0.25, 0.5].forEach((delay) => {
-      const osc = ctx.createOscillator()
-      const gain = ctx.createGain()
-      osc.frequency.value = 880
-      osc.connect(gain)
-      gain.connect(ctx.destination)
-      const t = ctx.currentTime + delay
-      gain.gain.setValueAtTime(0.0001, t)
-      gain.gain.exponentialRampToValueAtTime(0.4, t + 0.02)
-      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18)
-      osc.start(t)
-      osc.stop(t + 0.2)
-    })
+    try {
+      const ctx = audioRef.current
+      if (!ctx || ctx.state === 'closed') return
+      void ctx.resume()
+      ;[0, 0.25, 0.5].forEach((delay) => {
+        const osc = ctx.createOscillator()
+        const gain = ctx.createGain()
+        osc.frequency.value = 880
+        osc.connect(gain)
+        gain.connect(ctx.destination)
+        const t = ctx.currentTime + delay
+        gain.gain.setValueAtTime(0.0001, t)
+        gain.gain.exponentialRampToValueAtTime(0.4, t + 0.02)
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18)
+        osc.start(t)
+        osc.stop(t + 0.2)
+      })
+    } catch {
+      /* sem som */
+    }
   }
 
   // Tempo calculado por Date.now(): continua correto com a aba em segundo plano
@@ -69,6 +74,7 @@ export default function FocusMode({ block, api, onClose }: Props) {
         setEndAt(null)
         setPausedMs(0)
         setDone(true)
+        void notify('Tempo concluído!', `${block.title}: seu bloco de foco terminou.`)
         beep()
         navigator.vibrate?.([300, 150, 300, 150, 300])
       }
@@ -80,9 +86,37 @@ export default function FocusMode({ block, api, onClose }: Props) {
       clearInterval(id)
       document.removeEventListener('visibilitychange', tick)
     }
-  }, [endAt])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [endAt, block.title])
 
   const running = endAt !== null
+
+  // Mantém a tela acesa durante o foco
+  useEffect(() => {
+    if (!running) return
+    let lock: WakeLockSentinel | null = null
+    let cancelled = false
+    const request = async () => {
+      try {
+        const l = (await navigator.wakeLock?.request('screen')) ?? null
+        if (cancelled) void l?.release()
+        else lock = l
+      } catch {
+        /* não suportado ou negado */
+      }
+    }
+    void request()
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void request()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      cancelled = true
+      document.removeEventListener('visibilitychange', onVisible)
+      void lock?.release()
+    }
+  }, [running])
+
   const remaining = endAt !== null ? Math.max(0, endAt - now) : pausedMs
   const elapsedMs = Math.max(0, totalMs - remaining)
   const elapsedMin = Math.round(elapsedMs / 60_000)
